@@ -29,16 +29,14 @@ st.markdown("""
 st.title("📈 楽天証券対応 - 国内株式プロスクリーナー")
 st.caption("東証全銘柄（プライム・スタンダード・グロース）対応。条件を設定してワンクリックでスクリーニングします。")
 
-# 2. JPXから「最新の」全上場銘柄リストを動的に自動取得（エラー対策済）
+# 2. JPXから最新の全上場銘柄リストを自動取得
 @st.cache_data(ttl=86400)
 def load_jpx_stock_list():
     try:
-        # JPXの統計ページURL
         base_url = "https://www.jpx.co.jp"
         page_url = base_url + "/markets/statistics-equities/misc/01.html"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
-        # ページから最新のエクセルファイルのリンクを探す
         res = requests.get(page_url, headers=headers, timeout=10)
         res.raise_for_status()
         soup = BeautifulSoup(res.content, "html.parser")
@@ -51,15 +49,12 @@ def load_jpx_stock_list():
                 break
                 
         if not xls_url:
-            raise Exception("JPXページから銘柄リストのエクセルURLが見つかりませんでした。")
+            raise Exception("エクセルURLが見つかりません。")
 
-        # エクセルファイルをダウンロードしてPandasで読み込む
         res_xls = requests.get(xls_url, headers=headers, timeout=15)
         res_xls.raise_for_status()
         
         df = pd.read_excel(io.BytesIO(res_xls.content))
-        
-        # 必要な列を抽出してコードを yfinance 用 (.T) に変換
         df_stocks = df[['コード', '銘柄名', '市場・商品区分', '33業種区分']].copy()
         df_stocks['コード'] = df_stocks['コード'].astype(str) + ".T"
         
@@ -67,7 +62,6 @@ def load_jpx_stock_list():
 
     except Exception as e:
         st.error(f"JPX銘柄リストの自動読み込みに失敗しました: {e}")
-        # 取得失敗時の緊急用バックアップデータ
         fallback = pd.DataFrame({
             'コード': ['7203.T', '8306.T', '9432.T', '8058.T', '8591.T', '6758.T', '9984.T', '6861.T'],
             '銘柄名': ['トヨタ自動車', '三菱UFJ', 'NTT', '三菱商事', 'オリックス', 'ソニーグループ', 'ソフトバンクG', 'キーエンス'],
@@ -76,14 +70,15 @@ def load_jpx_stock_list():
         })
         return fallback
 
-# 3. 高速データ取得関数
+# 3. 高速データ取得関数（★ここでエラーの原因を修正しました）
 @st.cache_data(ttl=3600)
 def fetch_stock_financials(ticker_df):
     results = []
     my_bar = st.progress(0, text="株価データを取得中...")
     total = len(ticker_df)
     
-    for idx, row in ticker_df.iterrows():
+    # enumerate を使い、元の行番号(idx)ではなくループ回数(i)を取得する
+    for i, (idx, row) in enumerate(ticker_df.iterrows()):
         ticker = row['コード']
         name = row['銘柄名']
         market = row['市場・商品区分']
@@ -104,7 +99,6 @@ def fetch_stock_financials(ticker_df):
             market_cap = (info.get("marketCap") or 0) / 1e8
 
             if price:
-                # 楽天証券の個別銘柄URL
                 rakuten_url = f"https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric={clean_code}.T"
                 
                 results.append({
@@ -122,7 +116,8 @@ def fetch_stock_financials(ticker_df):
         except Exception:
             pass
         
-        my_bar.progress((idx + 1) / total, text=f"データ取得中 ({idx+1}/{total}): {name}")
+        # (idx + 1) ではなく、正しい進行数である (i + 1) を計算に使用する
+        my_bar.progress((i + 1) / total, text=f"データ取得中 ({i+1}/{total}): {name}")
         
     my_bar.empty()
     return pd.DataFrame(results)
@@ -172,8 +167,12 @@ run_btn = st.sidebar.button("🚀 スクリーニング実行", type="primary", 
 if run_btn or "df_results" in st.session_state:
     if run_btn:
         scan_list = df_target.head(max_scan)
-        with st.spinner(f"対象 {len(scan_list)} 銘柄のリアルタイム株価を取得中..."):
-            st.session_state["df_results"] = fetch_stock_financials(scan_list)
+        if not scan_list.empty:
+            with st.spinner(f"対象 {len(scan_list)} 銘柄のリアルタイム株価を取得中..."):
+                st.session_state["df_results"] = fetch_stock_financials(scan_list)
+        else:
+            st.warning("検索条件に該当する銘柄がありませんでした。条件を変更してください。")
+            st.session_state["df_results"] = pd.DataFrame()
 
     df_res = st.session_state.get("df_results", pd.DataFrame())
 
@@ -242,6 +241,6 @@ if run_btn or "df_results" in st.session_state:
             else:
                 st.info("条件に一致する銘柄はありませんでした。サイドバーの条件をゆるめてみてください。")
     else:
-        st.warning("データがありません。「🚀 スクリーニング実行」を押してください。")
+        st.write("") # データが空の場合はメッセージを抑制
 else:
     st.info("👈 左側のサイドバーで条件（市場・業種・指標など）を設定し、「🚀 スクリーニング実行」を押してください。")
