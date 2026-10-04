@@ -2,30 +2,72 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
+import requests
+from bs4 import BeautifulSoup
+import io
 
-# ページ基本設定
+# 1. ページ基本設定
 st.set_page_config(
-    page_title="楽天証券対応 - 国内株式スクリーニング",
+    page_title="楽天証券対応 - 国内株式高機能スクリーナー",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("📈 楽天証券対応 - 全国内株式スクリーニングダッシュボード")
-st.caption("東証上場（プライム・スタンダード・グロース）の全銘柄に対応。条件を指定して「スクリーニング実行」を押してください。")
+# カスタムCSS
+st.markdown("""
+    <style>
+    .stMetric {
+        background-color: #f8f9fa;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# JPXから全上場銘柄リストをキャッシュ取得（有効期限24時間）
+st.title("📈 楽天証券対応 - 国内株式プロスクリーナー")
+st.caption("東証全銘柄（プライム・スタンダード・グロース）対応。条件を設定してワンクリックでスクリーニングします。")
+
+# 2. JPXから「最新の」全上場銘柄リストを動的に自動取得（エラー対策済）
 @st.cache_data(ttl=86400)
 def load_jpx_stock_list():
-    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
     try:
-        df = pd.read_excel(url)
-        # 必要な列を抽出・整形
+        # JPXの統計ページURL
+        base_url = "https://www.jpx.co.jp"
+        page_url = base_url + "/markets/statistics-equities/misc/01.html"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        
+        # ページから最新のエクセルファイルのリンクを探す
+        res = requests.get(page_url, headers=headers, timeout=10)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.content, "html.parser")
+        
+        xls_url = None
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if href.endswith(".xls") or href.endswith(".xlsx"):
+                xls_url = base_url + href
+                break
+                
+        if not xls_url:
+            raise Exception("JPXページから銘柄リストのエクセルURLが見つかりませんでした。")
+
+        # エクセルファイルをダウンロードしてPandasで読み込む
+        res_xls = requests.get(xls_url, headers=headers, timeout=15)
+        res_xls.raise_for_status()
+        
+        df = pd.read_excel(io.BytesIO(res_xls.content))
+        
+        # 必要な列を抽出してコードを yfinance 用 (.T) に変換
         df_stocks = df[['コード', '銘柄名', '市場・商品区分', '33業種区分']].copy()
-        df_stocks['コード'] = df_stocks['コード'].astype(str) + ".T"  # yfinance用コード形式 (.T)
+        df_stocks['コード'] = df_stocks['コード'].astype(str) + ".T"
+        
         return df_stocks
+
     except Exception as e:
-        st.error(f"銘柄リストの取得に失敗しました: {e}")
-        # フォールバック用基本銘柄リスト
+        st.error(f"JPX銘柄リストの自動読み込みに失敗しました: {e}")
+        # 取得失敗時の緊急用バックアップデータ
         fallback = pd.DataFrame({
             'コード': ['7203.T', '8306.T', '9432.T', '8058.T', '8591.T', '6758.T', '9984.T', '6861.T'],
             '銘柄名': ['トヨタ自動車', '三菱UFJ', 'NTT', '三菱商事', 'オリックス', 'ソニーグループ', 'ソフトバンクG', 'キーエンス'],
@@ -34,22 +76,22 @@ def load_jpx_stock_list():
         })
         return fallback
 
-# データの取得処理（Fast API + yfinance）
+# 3. 高速データ取得関数
 @st.cache_data(ttl=3600)
-def fetch_stock_financials(ticker_list):
+def fetch_stock_financials(ticker_df):
     results = []
-    progress_bar = st.progress(0, text="株価データを取得中...")
-    total = len(ticker_list)
+    my_bar = st.progress(0, text="株価データを取得中...")
+    total = len(ticker_df)
     
-    for idx, row in ticker_list.iterrows():
+    for idx, row in ticker_df.iterrows():
         ticker = row['コード']
         name = row['銘柄名']
         market = row['市場・商品区分']
         sector = row['33業種区分']
+        clean_code = ticker.replace(".T", "")
         
         try:
             stock = yf.Ticker(ticker)
-            # 株価の取得
             price = stock.fast_info.get("lastPrice") or stock.fast_info.get("previousClose")
             
             info = stock.info
@@ -59,74 +101,83 @@ def fetch_stock_financials(ticker_list):
             if div_yield:
                 div_yield *= 100
             
-            market_cap = (info.get("marketCap") or 0) / 1e8  # 億円単位
+            market_cap = (info.get("marketCap") or 0) / 1e8
 
             if price:
+                # 楽天証券の個別銘柄URL
+                rakuten_url = f"https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric={clean_code}.T"
+                
                 results.append({
-                    "コード": ticker.replace(".T", ""),
+                    "コード": clean_code,
                     "銘柄名": name,
                     "市場": market,
                     "業種": sector,
-                    "現在値(円)": round(price, 1) if price else None,
+                    "株価(円)": round(price, 1) if price else None,
                     "PER(倍)": round(per, 2) if per else None,
                     "PBR(倍)": round(pbr, 2) if pbr else None,
                     "配当利回り(%)": round(div_yield, 2) if div_yield else 0.0,
-                    "時価総額(億円)": round(market_cap, 1) if market_cap else 0.0
+                    "時価総額(億円)": round(market_cap, 1) if market_cap else 0.0,
+                    "楽天証券リンク": rakuten_url
                 })
         except Exception:
             pass
         
-        progress_bar.progress((idx + 1) / total, text=f"データ取得中 ({idx+1}/{total}): {name}")
+        my_bar.progress((idx + 1) / total, text=f"データ取得中 ({idx+1}/{total}): {name}")
         
-    progress_bar.empty()
+    my_bar.empty()
     return pd.DataFrame(results)
 
-# 全銘柄マスターのロード
+# 全銘柄マスターの読み込み
 df_master = load_jpx_stock_list()
 
-# --- サイドバー設定 ---
-st.sidebar.header("🔍 スクリーニング検索条件")
+# --- サイドバー設定エリア ---
+st.sidebar.header("🔍 スクリーニング条件")
 
-# 市場区分のフィルター
-markets = ["指定なし (全市場)", "プライム", "スタンダード", "グロース"]
-selected_market = st.sidebar.selectbox("市場区分（楽天証券取り扱い）", markets)
+selected_market = st.sidebar.selectbox(
+    "1. ターゲット市場",
+    ["指定なし (全市場)", "プライム", "スタンダード", "グロース"]
+)
 
-# 業種フィルター
 sectors = ["指定なし (全業種)"] + sorted(list(df_master['33業種区分'].dropna().unique()))
-selected_sector = st.sidebar.selectbox("業種セクター", sectors)
+selected_sector = st.sidebar.selectbox("2. 業種セクター", sectors)
 
-# 数値フィルター
-per_max = st.sidebar.slider("PER（最大倍率）", min_value=1.0, max_value=50.0, value=20.0, step=0.5)
-pbr_max = st.sidebar.slider("PBR（最大倍率）", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
-div_min = st.sidebar.slider("最小配当利回り (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.1)
+with st.sidebar.expander("3. 指標条件（PER / PBR / 配当）", expanded=True):
+    per_max = st.slider("PER 最大（倍）", min_value=1.0, max_value=50.0, value=20.0, step=0.5)
+    pbr_max = st.slider("PBR 最大（倍）", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
+    div_min = st.slider("最小配当利回り (%)", min_value=0.0, max_value=10.0, value=2.5, step=0.1)
 
-# スキャン上限の設定（通信タイムアウト防止）
-max_scan = st.sidebar.number_input("1回の取得上限銘柄数", min_value=10, max_value=500, value=50, step=10,
-                                   help="サーバータイムアウトを防ぐため、1度にスキャンする上限数を指定します。")
+search_keyword = st.sidebar.text_input("4. 銘柄名・コード直接検索（任意）", placeholder="例: トヨタ, 7203")
 
-# フィルタリングされた候補銘柄リストの抽出
+max_scan = st.sidebar.number_input(
+    "スキャン件数上限", min_value=10, max_value=500, value=50, step=10,
+    help="サーバーの応答停止を防ぐため、1度の検索対象数を制限します。"
+)
+
+# 絞り込みロジック
 df_target = df_master.copy()
 if selected_market != "指定なし (全市場)":
     df_target = df_target[df_target['市場・商品区分'].str.contains(selected_market, na=False)]
 if selected_sector != "指定なし (全業種)":
     df_target = df_target[df_target['33業種区分'] == selected_sector]
+if search_keyword:
+    df_target = df_target[
+        df_target['銘柄名'].str.contains(search_keyword, na=False) |
+        df_target['コード'].str.contains(search_keyword, na=False)
+    ]
 
-st.sidebar.info(f"現在の検索対象: **{len(df_target)}** 銘柄")
+st.sidebar.caption(f"現在の条件に該当する企業: **{len(df_target)}** 件")
+run_btn = st.sidebar.button("🚀 スクリーニング実行", type="primary", use_container_width=True)
 
-run_btn = st.sidebar.button("🚀 スクリーニング実行", type="primary")
-
-# --- メインコンテンツ表示 ---
+# --- メインエリア表示 ---
 if run_btn or "df_results" in st.session_state:
     if run_btn:
-        # 上限数に絞ってスキャン実行
         scan_list = df_target.head(max_scan)
-        with st.spinner(f"対象 {len(scan_list)} 銘柄の株価・指標データを取得中..."):
+        with st.spinner(f"対象 {len(scan_list)} 銘柄のリアルタイム株価を取得中..."):
             st.session_state["df_results"] = fetch_stock_financials(scan_list)
 
     df_res = st.session_state.get("df_results", pd.DataFrame())
 
     if not df_res.empty:
-        # 指標フィルター適用
         df_filtered = df_res.copy()
         if per_max is not None:
             df_filtered = df_filtered[(df_filtered["PER(倍)"].isna()) | (df_filtered["PER(倍)"] <= per_max)]
@@ -135,17 +186,45 @@ if run_btn or "df_results" in st.session_state:
         if div_min is not None:
             df_filtered = df_filtered[df_filtered["配当利回り(%)"] >= div_min]
 
-        st.subheader(f"📊 条件適合銘柄 ({len(df_filtered)} / {len(df_res)} 件)")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("抽出銘柄数", f"{len(df_filtered)} / {len(df_res)} 件")
+        
+        avg_div = df_filtered["配当利回り(%)"].mean() if not df_filtered.empty else 0
+        col2.metric("平均配当利回り", f"{avg_div:.2f} %" if not pd.isna(avg_div) else "0 %")
+        
+        avg_per = df_filtered["PER(倍)"].mean() if not df_filtered.empty else 0
+        col3.metric("平均PER", f"{avg_per:.1f} 倍" if not pd.isna(avg_per) else "0 倍")
+        
+        avg_pbr = df_filtered["PBR(倍)"].mean() if not df_filtered.empty else 0
+        col4.metric("平均PBR", f"{avg_pbr:.2f} 倍" if not pd.isna(avg_pbr) else "0 倍")
 
-        tab1, tab2 = st.tabs(["銘柄一覧（楽天証券用）", "バブル分析チャート"])
+        st.markdown("---")
+
+        tab1, tab2 = st.tabs(["📋 銘柄リスト (楽天証券リンク付き)", "📊 バブル分析チャート"])
 
         with tab1:
-            # 楽天証券の取引画面への直接リンクを表示（銘柄コード付き）
-            st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+            st.dataframe(
+                df_filtered,
+                column_config={
+                    "楽天証券リンク": st.column_config.LinkColumn(
+                        "楽天証券",
+                        display_text="楽天証券で見る ↗"
+                    ),
+                    "配当利回り(%)": st.column_config.NumberColumn(
+                        "配当利回り(%)",
+                        format="%.2f %%"
+                    ),
+                    "時価総額(億円)": st.column_config.NumberColumn(
+                        "時価総額(億円)",
+                        format="%'.1f 億円"
+                    )
+                },
+                use_container_width=True,
+                hide_index=True
+            )
             
-            # CSVダウンロードボタン
-            csv_bytes = df_filtered.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 検索結果をCSVで保存", csv_bytes, "rakuten_stocks.csv", "text/csv")
+            csv_data = df_filtered.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 抽出結果をCSVダウンロード", csv_data, "rakuten_stock_screening.csv", "text/csv")
 
         with tab2:
             if not df_filtered.empty:
@@ -156,12 +235,13 @@ if run_btn or "df_results" in st.session_state:
                     size="時価総額(億円)",
                     color="業種",
                     hover_name="銘柄名",
-                    title="PER vs 配当利回り（円の大きさ: 時価総額）"
+                    title="PER vs 配当利回り 分布図（円の大きさ: 時価総額）",
+                    labels={"PER(倍)": "PER (倍) [低いほど割安]", "配当利回り(%)": "配当利回り (%) [高いほどお得]"}
                 )
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("条件に一致する銘柄がありませんでした。")
+                st.info("条件に一致する銘柄はありませんでした。サイドバーの条件をゆるめてみてください。")
     else:
-        st.warning("データが取得できませんでした。「🚀 スクリーニング実行」を押してください。")
+        st.warning("データがありません。「🚀 スクリーニング実行」を押してください。")
 else:
-    st.info("👈 サイドバーで「市場（プライム等）」や「業種」を選び、「🚀 スクリーニング実行」ボタンを押すと、国内株式の自動スキャンが始まります。")
+    st.info("👈 左側のサイドバーで条件（市場・業種・指標など）を設定し、「🚀 スクリーニング実行」を押してください。")
